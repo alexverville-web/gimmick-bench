@@ -139,7 +139,8 @@ async function poll() {
   if (s.running) {
     const title = s.current ? s.current.title : "Preparing";
     const step = it && it.test === (s.current || {}).test ? ` · ${it.phase === "warm-up" ? "warm-up run" : `run ${it.i} of ${it.n}`}` : "";
-    $("now").textContent = title + step;
+    const fr = s.frame && it && s.frame.tag && s.frame.t > (it.t || 0) ? ` · frame ${s.frame.n} of ${s.frame.of}` : "";
+    $("now").textContent = title + step + fr;
     $("eta").textContent = (s.status && !it ? s.status + ". " : "") + (s.eta_s ? `Rough estimate: ${minutes(s.eta_s)} left` : "Estimating time left after the first runs");
   } else {
     $("now").textContent = s.error ? "Stopped" : "Finished";

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from ..config import REPO_ROOT
+from .staging import staged
 from ..proc import run_timed
 from .discovery import C4DInstall, _exe
 
@@ -75,7 +76,7 @@ class Cinema4D:
         job_path.write_text(json.dumps(job), encoding="utf-8")
         env = dict(os.environ, GB_JOB=str(job_path))
         log = self.logs / f"c4dpy-{stamp}.log"
-        res = run_timed([str(self._c4dpy), str(SCRIPTS / script)], timeout=timeout, env=env, log_path=log)
+        res = run_timed([str(self._c4dpy), str(staged(SCRIPTS, "c4d-scripts") / script)], timeout=timeout, env=env, log_path=log)
         if not done_path.exists():
             text = res.output[-600:]
             if LICENSE_HINT.search(text):
@@ -107,7 +108,7 @@ class Cinema4D:
         scenes_dir = self.work / "scenes"
         scenes_dir.mkdir(exist_ok=True)
         payload = self.run_job("build_scenes.py", {
-            "out_dir": str(scenes_dir), "assets_dir": str(ASSETS),
+            "out_dir": str(scenes_dir), "assets_dir": str(staged(ASSETS, "footage")),
         }, timeout=3600)
         payload["fingerprint"] = fp
         manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")

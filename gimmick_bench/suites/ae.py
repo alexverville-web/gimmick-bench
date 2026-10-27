@@ -90,7 +90,8 @@ class AeRenderTest(BenchTest):
 
     def run_once(self, ctx: RunContext, params: Dict[str, Any], iteration: int) -> Measurement:
         tag = f"{self.spec.id}-{iteration if iteration >= 0 else 'warmup'}"
-        r = self.ae.render(params["comp"], params["start"], params["end"], params["mfr"], tag)
+        r = self.ae.render(params["comp"], params["start"], params["end"], params["mfr"], tag,
+                           progress=lambda n, of: ctx.on_event({"type": "frame", "tag": tag, "n": n, "of": of}))
         seconds = r["seconds"]
         value = seconds
         if self.spec.metric == "fps" and seconds:

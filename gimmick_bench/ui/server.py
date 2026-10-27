@@ -26,10 +26,14 @@ class State:
         self.cancel = threading.Event()
         self.info: Optional[Dict[str, Any]] = None
         self.info_error: Optional[str] = None
+        self.frame: Optional[Dict[str, Any]] = None
 
     def add(self, e: Dict[str, Any]) -> None:
         e = dict(e, t=time.time())
         with self.lock:
+            if e.get("type") == "frame":  # one per rendered frame: keep only the latest
+                self.frame = e
+                return
             self.events.append(e)
             del self.events[:-400]
 
@@ -46,6 +50,7 @@ class State:
                 "progress": last_iter.get("progress") if last_iter else 0,
                 "eta_s": last_iter.get("eta_s") if last_iter else None,
                 "iteration": last_iter,
+                "frame": self.frame,
                 "finished": done,
                 "result_path": self.result_path,
                 "error": self.error,

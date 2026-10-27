@@ -10,9 +10,10 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from ..config import REPO_ROOT
+from .staging import staged
 from ..proc import ProcResult, run_timed
 from .discovery import AEInstall
 
@@ -37,6 +38,7 @@ def build_fingerprint(ae: AEInstall) -> str:
     """Changes when the AE version, the build script or the footage changes."""
     h = hashlib.sha256()
     h.update((ae.version or ae.year).encode())
+    h.update(b"footage-staged-in-home")
     for p in sorted(SCRIPTS.glob("*.jsx")):
         h.update(p.read_bytes())
     sums = ASSETS / "SHA256SUMS"
@@ -158,6 +160,47 @@ def allow_script_file_access(install: AEInstall) -> List[str]:
     return changed
 
 
+STARTUP_LAUNCHER = "gimmick_bench_launcher.jsx"
+STARTUP_SCRIPT = """// Gimmick Bench: runs a queued benchmark job when After Effects starts.
+// Does nothing unless the benchmark is running. Safe to delete.
+(function () {
+    var q = new File(Folder("~").fsName + "/GimmickBench/ae-queue.txt");
+    if (!q.exists) { return; }
+    q.encoding = "UTF-8";
+    if (!q.open("r")) { return; }
+    var path = q.read().replace(/^\\s+|\\s+$/g, "");
+    q.close();
+    q.remove();
+    if (!path) { return; }
+    app.scheduleTask("$.evalFile(new File(\\"" + path + "\\"))", 3000, false);
+})();
+"""
+
+
+def ae_queue_file() -> Path:
+    # Fixed location (not GIMMICK_BENCH_HOME): the startup script must find it on its own.
+    return Path.home() / "GimmickBench" / "ae-queue.txt"
+
+
+def install_startup_launcher(install: AEInstall) -> List[Path]:
+    """Put the launcher in After Effects' Startup script folders that we can write to."""
+    folders = [install.root / "Scripts" / "Startup"]
+    # Per-user script folder, only where this AE version already has one.
+    folders += [f.parent / "Scripts" / "Startup" for f in ae_pref_files(install)
+                if (f.parent / "Scripts").is_dir()]
+    written = []
+    for folder in folders:
+        target = folder / STARTUP_LAUNCHER
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            if not target.exists() or target.read_text(encoding="utf-8") != STARTUP_SCRIPT:
+                target.write_text(STARTUP_SCRIPT, encoding="utf-8")
+            written.append(target)
+        except OSError:
+            continue
+    return written
+
+
 def _running_mac_apps(process_name: str) -> List[str]:
     """Bundle paths of running apps whose executable is called process_name."""
     r = subprocess.run(["pgrep", "-x", process_name], capture_output=True, text=True)
@@ -196,7 +239,7 @@ class AfterEffects:
             f'(function () {{ var f = new File("{_js_path(started_path)}"); '
             f'if (f.open("w")) {{ f.write("1"); f.close(); }} }})();\n'
             f'var GB_JOB_PATH = "{_js_path(job_path)}";\n'
-            f'var GB_SCRIPTS_DIR = "{_js_path(SCRIPTS)}";\n'
+            f'var GB_SCRIPTS_DIR = "{_js_path(staged(SCRIPTS, "ae-scripts"))}";\n'
             f'$.evalFile(GB_SCRIPTS_DIR + "/common.jsx");\n'
             f'$.evalFile(GB_SCRIPTS_DIR + "/{script}");\n',
             encoding="utf-8",
@@ -226,6 +269,30 @@ class AfterEffects:
         return payload
 
     def _mac_do_script(self, wrapper: Path, started_path: Path, log: Path, timeout: float):
+        """Run the wrapper in After Effects on macOS without any permission prompt if possible.
+
+        First choice: a tiny script in After Effects' Startup folder runs the queued job
+        when AE is launched with `open`. That needs no Automation permission, and it runs
+        only once AE has finished loading. Fallback: AppleScript DoScript."""
+        launchers = install_startup_launcher(self.install)
+        if launchers:
+            for attempt in range(2):
+                queue = ae_queue_file()
+                queue.parent.mkdir(parents=True, exist_ok=True)
+                queue.write_text(_js_path(wrapper), encoding="utf-8")
+                proc = subprocess.Popen(["open", "-W", "-a", str(self.install.app)],
+                                        stdout=open(log, "w"), stderr=subprocess.STDOUT)
+                end = time.time() + 300
+                while time.time() < end and not started_path.exists():
+                    time.sleep(1)
+                if started_path.exists():
+                    return proc
+                queue.unlink(missing_ok=True)
+                proc.kill()
+                self._force_quit()
+        return self._mac_apple_event(wrapper, started_path, log, timeout)
+
+    def _mac_apple_event(self, wrapper: Path, started_path: Path, log: Path, timeout: float):
         """Launch After Effects, wait until it has finished starting, then send DoScript.
 
         A DoScript sent while AE is still loading fails with "Scripting Plugin is not
@@ -358,7 +425,7 @@ class AfterEffects:
         render_dir = self.work / "render"
         render_dir.mkdir(exist_ok=True)
         job = {
-            "assets_dir": _js_path(ASSETS),
+            "assets_dir": _js_path(staged(ASSETS, "footage")),
             "project_path": _js_path(self.project_path),
             "render_dir": _js_path(render_dir),
         }
@@ -384,7 +451,8 @@ class AfterEffects:
         raise AfterEffectsError(f"{comp} is not in the render queue of the built project")
 
     # ---------------------------------------------------------------- render
-    def render(self, comp: str, start: int, end: int, mfr: bool, tag: str) -> Dict[str, Any]:
+    def render(self, comp: str, start: int, end: int, mfr: bool, tag: str,
+               progress: Optional[Callable[[int, int], None]] = None) -> Dict[str, Any]:
         rq = self.output_for(comp)
         out_dir = self.work / "render" / tag
         if out_dir.exists():
@@ -408,7 +476,14 @@ class AfterEffects:
         ]
         log = self.logs / f"aerender-{tag}.log"
         frames = end - start + 1
-        res: ProcResult = run_timed(cmd, timeout=max(1800, frames * 60), log_path=log)
+        seen = [0]
+
+        def on_line(tl) -> None:
+            if progress and FRAME_LINE.search(tl.text):
+                seen[0] += 1
+                progress(min(seen[0], frames), frames)
+
+        res: ProcResult = run_timed(cmd, timeout=max(1800, frames * 60), log_path=log, on_line=on_line)
         timing = parse_render_timing(res.lines, frames)
         out_files = [p for p in out_dir.iterdir() if p.is_file()]
         detail = {
