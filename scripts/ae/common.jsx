@@ -68,6 +68,12 @@ function gbFinish(job, payload) {
     gbWriteText(job.done_path, gbStringify(payload));
 }
 
+// Quit without the "save changes?" dialog, which would leave the benchmark waiting.
+function gbQuit() {
+    gbProjectClose();
+    app.quit();
+}
+
 function gbProjectClose() {
     if (app.project) {
         try { app.project.close(CloseOptions.DO_NOT_SAVE_CHANGES); } catch (e) {}

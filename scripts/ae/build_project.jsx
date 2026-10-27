@@ -160,7 +160,7 @@ function buildShapes() {
         var pl = comp.layers.add(tile);
         pl.motionBlur = true;
         var t = pl.property("ADBE Transform Group");
-        keys(t, "ADBE Rotation", [0, DUR], [k * 15, k * 15 + 90]);
+        keys(t, "ADBE Rotate Z", [0, DUR], [k * 15, k * 15 + 90]);
         setp(t, "ADBE Scale", [70 + k * 8, 70 + k * 8]);
         pl.startTime = -k * 0.4;
         count("precomp_instances");
@@ -241,7 +241,7 @@ function buildExpressions() {
                 "var s = thisComp.layer(\"NOISE\").sampleImage(transform.position, [6, 6], true, time);\n" +
                 "var l = (s[0] + s[1] + s[2]) / 3; [40 + l * 140, 40 + l * 140];",
                 "dot scale");
-            var rot = t.property("ADBE Rotation");
+            var rot = t.property("ADBE Rotate Z");
             if (c % 8 === 0) {
                 rot.setValuesAtTimes([0, 1, 2], [0, 120, 0]);
                 expr(rot, "loopOut(\"pingpong\")", "leader rotation");
@@ -259,7 +259,7 @@ function buildExpressions() {
         expr(tl.property("ADBE Text Properties").property("ADBE Text Document"),
             "var n = Math.floor(time * 25 + index * 13);\n\"GIMMICK \" + n + \"  \" + timeToTimecode(time);",
             "source text");
-        expr(tt.property("ADBE Rotation"), "wiggle(1.5, 12)", "text rotation");
+        expr(tt.property("ADBE Rotate Z"), "wiggle(1.5, 12)", "text rotation");
         addTextAnimator(tl, rnd);
     }
     noise.moveToEnd();
@@ -334,7 +334,7 @@ function buildMixed(job) {
     var it = inset.property("ADBE Transform Group");
     keys(it, "ADBE Position", [0, DUR], [[W * 0.3, H * 0.4], [W * 0.7, H * 0.45]]);
     keys(it, "ADBE Scale", [0, DUR], [[45, 45], [60, 60]]);
-    keys(it, "ADBE Rotation", [0, DUR], [-6, 6]);
+    keys(it, "ADBE Rotate Z", [0, DUR], [-6, 6]);
     inset.motionBlur = true;
     rectMask(inset, 200, 150, W - 400, H - 300, 120);
     fx(inset, "ADBE Drop Shadow");
@@ -405,6 +405,7 @@ function buildEffects(job, footageA) {
 
 // ---------------------------------------------------------------- render queue
 function wrapper(name, inner) {
+    if (!inner) { return null; }
     var c = newComp(name, inner.duration);
     c.layers.add(inner);
     return c;
@@ -431,6 +432,7 @@ function formatOf(om) {
 }
 
 function queue(comp, outDir, kind, rs, manifest) {
+    if (!comp) { return null; }
     var item = app.project.renderQueue.items.add(comp);
     var used = { comp: comp.name, kind: kind };
     var rsName = pickName(item.templates, RS_PATTERNS[rs]);
@@ -482,18 +484,28 @@ function gbBuild(job) {
         counts: gbCounts
     };
 
-    var shapes = buildShapes();
-    var expressions = buildExpressions();
-    var mixed = buildMixed(job);
+    // Each comp is built on its own: one that fails is reported as missing and only
+    // its tests error out, instead of stopping the whole After Effects suite.
+    function section(name, build) {
+        try { return build(); }
+        catch (e) {
+            gbMissing.push({ what: "comp " + name, where: e.toString() + (e.line ? " (line " + e.line + ")" : "") });
+            return null;
+        }
+    }
+    var shapes = section("BENCH_shapes", buildShapes);
+    var expressions = section("BENCH_expressions", buildExpressions);
+    var mixed = section("BENCH_mixed_4k", function () { return buildMixed(job); });
     var footageA = null;
     for (var i = 1; i <= app.project.numItems; i++) {
         var it = app.project.item(i);
         if (it instanceof FootageItem && it.name.indexOf("clip_a_4k") === 0) { footageA = it; }
     }
-    var effects = buildEffects(job, footageA);
-    var preview = wrapper("BENCH_preview", effects);
-    var prores = wrapper("BENCH_export_prores", mixed);
-    var h264 = wrapper("BENCH_export_h264", mixed);
+    var effects = footageA ? section("BENCH_effects", function () { return buildEffects(job, footageA); }) : null;
+    if (!footageA) { gbMissing.push({ what: "comp BENCH_effects", where: "footage A was not imported" }); }
+    var preview = section("BENCH_preview", function () { return wrapper("BENCH_preview", effects); });
+    var prores = section("BENCH_export_prores", function () { return wrapper("BENCH_export_prores", mixed); });
+    var h264 = section("BENCH_export_h264", function () { return wrapper("BENCH_export_h264", mixed); });
 
     var out = job.render_dir;
     queue(shapes, out, "jpeg", "best", manifest);
@@ -512,7 +524,7 @@ function gbBuild(job) {
     }
 
     // Surface expressions that failed to evaluate, so a broken build is never benchmarked silently.
-    manifest.expression_errors = gbExpressionErrors(expressions, 0.5);
+    manifest.expression_errors = expressions ? gbExpressionErrors(expressions, 0.5) : [];
 
     app.project.save(new File(job.project_path));
     app.endSuppressDialogs(false);
@@ -556,5 +568,5 @@ function gbExpressionErrors(comp, t) {
         payload.missing = gbMissing;
     }
     gbFinish(job, payload);
-    if (job.quit) { app.quit(); }
+    if (job.quit) { gbQuit(); }
 })();

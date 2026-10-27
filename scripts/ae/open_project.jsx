@@ -22,5 +22,5 @@
         payload.error = e.toString();
     }
     gbFinish(job, payload);
-    if (job.quit) { app.quit(); }
+    if (job.quit) { gbQuit(); }
 })();

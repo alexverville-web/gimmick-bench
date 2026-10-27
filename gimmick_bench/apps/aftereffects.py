@@ -378,6 +378,9 @@ class AfterEffects:
         for rq in (self.manifest or {}).get("render_queue", []):
             if rq.get("comp") == comp:
                 return rq
+        for m in (self.manifest or {}).get("missing", []):
+            if m.get("what") == f"comp {comp}":
+                raise AfterEffectsError(f"{comp} could not be built in this version: {m.get('where')}")
         raise AfterEffectsError(f"{comp} is not in the render queue of the built project")
 
     # ---------------------------------------------------------------- render
