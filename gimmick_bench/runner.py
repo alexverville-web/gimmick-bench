@@ -143,9 +143,12 @@ def run_benchmark(
     def event(e: Dict[str, Any]) -> None:
         nonlocal done_iters
         if e.get("type") == "iteration":
+            # Timed from the first run, so detection and the project build do not inflate it.
             if done_iters:
                 elapsed = time.time() - iter_started[0]
                 e["eta_s"] = round(elapsed / done_iters * (total_iters - done_iters))
+            else:
+                iter_started[0] = time.time()
             done_iters += 1
             e["progress"] = round(done_iters / total_iters, 3)
         on_event(e)
