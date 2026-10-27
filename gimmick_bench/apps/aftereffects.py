@@ -105,6 +105,19 @@ def parse_render_timing(lines, frames_expected: Optional[int] = None) -> Dict[st
     return out
 
 
+def _running_mac_apps(process_name: str) -> List[str]:
+    """Bundle paths of running apps whose executable is called process_name."""
+    r = subprocess.run(["pgrep", "-x", process_name], capture_output=True, text=True)
+    apps = []
+    for pid in r.stdout.split():
+        exe = subprocess.run(["ps", "-o", "comm=", "-p", pid], capture_output=True, text=True).stdout.strip()
+        if ".app/" in exe:
+            bundle = exe[:exe.index(".app/") + 4]
+            if bundle not in apps:
+                apps.append(bundle)
+    return apps
+
+
 class AfterEffects:
     def __init__(self, install: AEInstall, work: Path, logs: Path):
         self.install = install
@@ -117,6 +130,7 @@ class AfterEffects:
     # ---------------------------------------------------------------- scripts
     def run_script(self, script: str, job: Dict[str, Any], timeout: float = 1800) -> Dict[str, Any]:
         """Run one of our .jsx files inside After Effects and return what it wrote."""
+        self.ensure_closed()
         stamp = f"{script.replace('.jsx', '')}-{int(time.time() * 1000)}"
         job_path = self.work / f"{stamp}.job.json"
         done_path = self.work / f"{stamp}.done.json"
@@ -189,6 +203,28 @@ class AfterEffects:
                            capture_output=True, text=True)
         return "AfterFX.exe" in r.stdout
 
+    def ensure_closed(self, timeout: float = 90) -> None:
+        """Ask any open After Effects to quit, the same way as Cmd+Q / closing the window.
+
+        It still asks about unsaved work; nothing is force-killed."""
+        if not self.gui_running():
+            return
+        if IS_MAC:
+            for app in _running_mac_apps("After Effects"):
+                subprocess.run(["osascript", "-e", f'tell application "{app}" to quit'],
+                               capture_output=True, timeout=60)
+        else:
+            subprocess.run(["taskkill", "/IM", "AfterFX.exe"], capture_output=True)
+        end = time.time() + timeout
+        while time.time() < end:
+            if not self.gui_running():
+                time.sleep(3)  # let it release its files and licence
+                return
+            time.sleep(1)
+        raise AfterEffectsError(
+            "After Effects is open and did not quit (it may be asking to save a project). "
+            "Quit it, then start the benchmark again.")
+
     # ---------------------------------------------------------------- project
     def ensure_project(self) -> Dict[str, Any]:
         """Build the benchmark project unless an identical one already exists."""
@@ -202,8 +238,6 @@ class AfterEffects:
         problems = verify_assets()
         if problems:
             raise AfterEffectsError("Benchmark footage is damaged: " + "; ".join(problems))
-        if self.gui_running():
-            raise AfterEffectsError("Please quit After Effects before starting the benchmark.")
         render_dir = self.work / "render"
         render_dir.mkdir(exist_ok=True)
         payload = self.run_script("build_project.jsx", {
