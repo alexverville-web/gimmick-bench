@@ -1,0 +1,584 @@
+"""After Effects driver: builds the benchmark project with ExtendScript and renders with aerender."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+
+from ..config import REPO_ROOT
+from .staging import staged
+from ..proc import ProcResult, run_timed
+from .discovery import AEInstall
+
+SCRIPTS = REPO_ROOT / "scripts" / "ae"
+ASSETS = REPO_ROOT / "assets" / "footage"
+IS_MAC = sys.platform == "darwin"
+
+# aerender prints one progress line per frame, e.g.
+#   PROGRESS:  0;00;00;12 (13): 1 Seconds        (timecode display)
+#   PROGRESS:  00012 (13): 1 Seconds              (frames display)
+FRAME_LINE = re.compile(r"PROGRESS:\s+[\d;:]+\s+\((\d+)\)")
+START_LINE = re.compile(r"Starting composition", re.I)
+FINISH_LINE = re.compile(r"Finished composition", re.I)
+ERROR_LINE = re.compile(r"aerender ERROR|^ERROR|After Effects error", re.I)
+
+
+class AfterEffectsError(RuntimeError):
+    pass
+
+
+def build_fingerprint(ae: AEInstall) -> str:
+    """Changes when the AE version, the build script or the footage changes."""
+    h = hashlib.sha256()
+    h.update((ae.version or ae.year).encode())
+    h.update(b"footage-staged-in-home")
+    for p in sorted(SCRIPTS.glob("*.jsx")):
+        h.update(p.read_bytes())
+    sums = ASSETS / "SHA256SUMS"
+    if sums.exists():
+        h.update(sums.read_bytes())
+    return h.hexdigest()[:12]
+
+
+def verify_assets() -> List[str]:
+    """Return a list of problems with the committed footage (empty means fine)."""
+    sums = ASSETS / "SHA256SUMS"
+    if not sums.exists():
+        return ["assets/footage/SHA256SUMS is missing"]
+    problems = []
+    for line in sums.read_text().splitlines():
+        if not line.strip():
+            continue
+        digest, name = line.split(None, 1)
+        f = ASSETS / name.strip().lstrip("*")
+        if not f.exists():
+            problems.append(f"missing {f.name}")
+            continue
+        h = hashlib.sha256()
+        with open(f, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        if h.hexdigest() != digest:
+            problems.append(f"checksum mismatch for {f.name}")
+    return problems
+
+
+def parse_render_timing(lines, frames_expected: Optional[int] = None) -> Dict[str, Any]:
+    """Work out how long the render itself took from timestamped aerender output.
+
+    Preferred: time between the "Starting composition" and "Finished
+    composition" lines. Those lines are English-only, so the fallback uses the
+    per-frame progress lines, which look the same in every language:
+    (last - first) * frames / (frames - 1). The last resort is wall time,
+    which includes application start-up and is flagged as such.
+    """
+    start = finish = None
+    frame_times = []
+    errors = []
+    for l in lines:
+        if start is None and START_LINE.search(l.text):
+            start = l.t
+        if FINISH_LINE.search(l.text):
+            finish = l.t
+        if FRAME_LINE.search(l.text):
+            frame_times.append(l.t)
+        if ERROR_LINE.search(l.text):
+            errors.append(l.text.strip())
+    out: Dict[str, Any] = {"frames_seen": len(frame_times), "errors": errors[:5]}
+    if start is not None and finish is not None and finish > start:
+        out["render_s"] = finish - start
+        out["method"] = "start_finish_lines"
+    elif len(frame_times) >= 3:
+        span = frame_times[-1] - frame_times[0]
+        n = len(frame_times)
+        out["render_s"] = span * n / (n - 1)
+        out["method"] = "frame_lines"
+    else:
+        out["render_s"] = None
+        out["method"] = "wall_time"
+    if frames_expected is not None and frame_times and len(frame_times) < frames_expected:
+        out["frames_missing"] = frames_expected - len(frame_times)
+    return out
+
+
+SCRIPT_PREF_SECTION = '["Main Pref Section v2"]'
+SCRIPT_PREF_KEY = '"Pref_SCRIPTING_FILE_NETWORK_SECURITY"'
+
+
+def ae_pref_files(install: AEInstall) -> List[Path]:
+    """The preference files of this After Effects version (only exist after a first launch)."""
+    if IS_MAC:
+        base = Path.home() / "Library" / "Preferences" / "Adobe" / "After Effects"
+    else:
+        base = Path(os.environ.get("APPDATA", "")) / "Adobe" / "After Effects"
+    pattern = f"{install.major}.*" if install.major else "*"
+    return sorted(base.glob(f"{pattern}/Adobe After Effects * Prefs*.txt"))
+
+
+def enable_script_pref(text: str) -> Optional[str]:
+    """Turn on 'Allow Scripts to Write Files and Access Network'. None if already on."""
+    m = re.search(re.escape(SCRIPT_PREF_KEY) + r"\s*=\s*(\d+)", text)
+    if m:
+        if int(m.group(1)) != 0:
+            return None
+        return text[:m.start(1)] + "01" + text[m.end(1):]
+    i = text.find(SCRIPT_PREF_SECTION)
+    if i < 0:
+        return None
+    eol = text.find("\n", i)
+    eol = len(text) if eol < 0 else eol + 1
+    nl = "\r\n" if "\r\n" in text else "\n"
+    return text[:eol] + f"\t{SCRIPT_PREF_KEY} = 01{nl}" + text[eol:]
+
+
+def allow_script_file_access(install: AEInstall) -> List[str]:
+    """Set the scripting preference so a forgotten checkbox does not stop the benchmark.
+
+    After Effects must be closed: it rewrites the file when it quits."""
+    changed = []
+    for f in ae_pref_files(install):
+        try:
+            raw = f.read_bytes()
+            text = raw.decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        new = enable_script_pref(text)
+        if new is None:
+            continue
+        backup = f.with_name(f.name + ".gimmick-bench.bak")
+        if not backup.exists():
+            backup.write_bytes(raw)
+        f.write_bytes(new.encode("utf-8"))
+        changed.append(str(f))
+    return changed
+
+
+STARTUP_LAUNCHER = "gimmick_bench_launcher.jsx"
+STARTUP_SCRIPT = """// Gimmick Bench: runs a queued benchmark job when After Effects starts.
+// Does nothing unless the benchmark is running. Safe to delete.
+(function () {
+    var q = new File(Folder("~").fsName + "/GimmickBench/ae-queue.txt");
+    if (!q.exists) { return; }
+    q.encoding = "UTF-8";
+    if (!q.open("r")) { return; }
+    var path = q.read().replace(/^\\s+|\\s+$/g, "");
+    q.close();
+    q.remove();
+    if (!path) { return; }
+    app.scheduleTask("$.evalFile(new File(\\"" + path + "\\"))", 3000, false);
+})();
+"""
+
+
+def ae_queue_file() -> Path:
+    # Fixed location (not GIMMICK_BENCH_HOME): the startup script must find it on its own.
+    return Path.home() / "GimmickBench" / "ae-queue.txt"
+
+
+def install_startup_launcher(install: AEInstall) -> List[Path]:
+    """Put the launcher in After Effects' Startup script folders that we can write to."""
+    folders = [install.root / "Scripts" / "Startup"]
+    # Per-user script folder, only where this AE version already has one.
+    folders += [f.parent / "Scripts" / "Startup" for f in ae_pref_files(install)
+                if (f.parent / "Scripts").is_dir()]
+    written = []
+    for folder in folders:
+        target = folder / STARTUP_LAUNCHER
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            if not target.exists() or target.read_text(encoding="utf-8") != STARTUP_SCRIPT:
+                target.write_text(STARTUP_SCRIPT, encoding="utf-8")
+            written.append(target)
+        except OSError:
+            continue
+    return written
+
+
+def disk_cache_dirs(install: AEInstall) -> List[Path]:
+    """After Effects disk cache folders at their default places.
+
+    Each aerender run would otherwise reuse frames cached by the previous one and
+    measure reading the cache instead of rendering (seen on the first real run:
+    later runs 5 to 20 times faster than the first)."""
+    if IS_MAC:
+        roots = [Path.home() / "Library" / "Caches" / "Adobe" / "After Effects"]
+    else:
+        roots = [Path(os.environ.get("APPDATA", "")) / "Adobe" / "After Effects",
+                 Path(os.environ.get("LOCALAPPDATA", "")) / "Adobe" / "After Effects",
+                 Path(os.environ.get("LOCALAPPDATA", "")) / "Temp"]
+    found = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for p in list(root.glob("*")) + list(root.glob("*/*")):
+            if p.is_dir() and "disk cache" in p.name.lower():
+                found.append(p)
+    return found
+
+
+def clear_disk_cache(install: AEInstall) -> Dict[str, Any]:
+    """Empty the disk cache folders (their contents, not the folders). Returns what was done."""
+    out: Dict[str, Any] = {"folders": [], "bytes": 0}
+    for d in disk_cache_dirs(install):
+        size = 0
+        for p in d.rglob("*"):
+            try:
+                if p.is_file():
+                    size += p.stat().st_size
+            except OSError:
+                pass
+        for child in d.iterdir():
+            try:
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink()
+            except OSError:
+                pass
+        out["folders"].append(str(d))
+        out["bytes"] += size
+    return out
+
+
+def cache_prefs(install: AEInstall) -> List[str]:
+    """Preference lines that mention a cache, kept in the result to check the cache handling."""
+    lines = []
+    for f in ae_pref_files(install):
+        try:
+            for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+                if "cache" in line.lower() and len(lines) < 40:
+                    lines.append(line.strip()[:200])
+        except OSError:
+            pass
+    return lines
+
+
+def _running_mac_apps(process_name: str) -> List[str]:
+    """Bundle paths of running apps whose executable is called process_name."""
+    r = subprocess.run(["pgrep", "-x", process_name], capture_output=True, text=True)
+    apps = []
+    for pid in r.stdout.split():
+        exe = subprocess.run(["ps", "-o", "comm=", "-p", pid], capture_output=True, text=True).stdout.strip()
+        if ".app/" in exe:
+            bundle = exe[:exe.index(".app/") + 4]
+            if bundle not in apps:
+                apps.append(bundle)
+    return apps
+
+
+class AfterEffects:
+    def __init__(self, install: AEInstall, work: Path, logs: Path):
+        self.install = install
+        self.work = work / f"ae-{(install.version or install.year).replace(' ', '_')}"
+        self.work.mkdir(parents=True, exist_ok=True)
+        self.logs = logs
+        self.project_path = self.work / "gimmick_bench_ae.aep"
+        self.manifest: Optional[Dict[str, Any]] = None
+
+    # ---------------------------------------------------------------- scripts
+    def run_script(self, script: str, job: Dict[str, Any], timeout: float = 1800) -> Dict[str, Any]:
+        """Run one of our .jsx files inside After Effects and return what it wrote."""
+        self.ensure_closed()
+        allow_script_file_access(self.install)
+        stamp = f"{script.replace('.jsx', '')}-{int(time.time() * 1000)}"
+        job_path = self.work / f"{stamp}.job.json"
+        done_path = self.work / f"{stamp}.done.json"
+        wrapper = self.work / f"{stamp}.wrapper.jsx"
+        job = dict(job, done_path=_js_path(done_path), quit=True)
+        job_path.write_text(json.dumps(job), encoding="utf-8")
+        started_path = self.work / f"{stamp}.started"
+        wrapper.write_text(
+            f'(function () {{ var f = new File("{_js_path(started_path)}"); '
+            f'if (f.open("w")) {{ f.write("1"); f.close(); }} }})();\n'
+            f'var GB_JOB_PATH = "{_js_path(job_path)}";\n'
+            f'var GB_SCRIPTS_DIR = "{_js_path(staged(SCRIPTS, "ae-scripts"))}";\n'
+            f'$.evalFile(GB_SCRIPTS_DIR + "/common.jsx");\n'
+            f'$.evalFile(GB_SCRIPTS_DIR + "/{script}");\n',
+            encoding="utf-8",
+        )
+        log = self.logs / f"{stamp}.log"
+        if IS_MAC:
+            proc = self._mac_do_script(wrapper, started_path, log, timeout)
+        else:
+            proc = subprocess.Popen([str(self.install.app), "-r", str(wrapper)],
+                                    stdout=open(log, "w"), stderr=subprocess.STDOUT)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if done_path.exists():
+                break
+            time.sleep(1)
+        else:
+            proc.kill()
+            raise AfterEffectsError(f"After Effects did not finish {script} within {int(timeout)} s")
+        time.sleep(0.5)
+        try:
+            payload = json.loads(done_path.read_text(encoding="utf-8"))
+        except ValueError as e:
+            raise AfterEffectsError(f"Unreadable result from {script}: {e}")
+        self._wait_for_quit(proc)
+        if not payload.get("ok"):
+            raise AfterEffectsError(f"{script} failed: {payload.get('error')}")
+        return payload
+
+    def _mac_do_script(self, wrapper: Path, started_path: Path, log: Path, timeout: float):
+        """Run the wrapper in After Effects on macOS without any permission prompt if possible.
+
+        First choice: a tiny script in After Effects' Startup folder runs the queued job
+        when AE is launched with `open`. That needs no Automation permission, and it runs
+        only once AE has finished loading. Fallback: AppleScript DoScript."""
+        launchers = install_startup_launcher(self.install)
+        if launchers:
+            for attempt in range(2):
+                queue = ae_queue_file()
+                queue.parent.mkdir(parents=True, exist_ok=True)
+                queue.write_text(_js_path(wrapper), encoding="utf-8")
+                proc = subprocess.Popen(["open", "-W", "-a", str(self.install.app)],
+                                        stdout=open(log, "w"), stderr=subprocess.STDOUT)
+                end = time.time() + 300
+                while time.time() < end and not started_path.exists():
+                    time.sleep(1)
+                if started_path.exists():
+                    return proc
+                queue.unlink(missing_ok=True)
+                proc.kill()
+                self._force_quit()
+        return self._mac_apple_event(wrapper, started_path, log, timeout)
+
+    def _mac_apple_event(self, wrapper: Path, started_path: Path, log: Path, timeout: float):
+        """Launch After Effects, wait until it has finished starting, then send DoScript.
+
+        A DoScript sent while AE is still loading fails with "Scripting Plugin is not
+        installed" and leaves a dialog open, so we wait for it to settle and retry with
+        a longer wait if the script did not start."""
+        js = f'$.evalFile(\\"{_js_path(wrapper)}\\")'
+        cmd = [
+            "osascript",
+            "-e", f"with timeout of {int(timeout)} seconds",
+            "-e", f'tell application "{self.install.app}" to DoScript "{js}"',
+            "-e", "end timeout",
+        ]
+        last_output = ""
+        for attempt, settle in enumerate((20, 45, 90)):
+            subprocess.run(["open", "-a", str(self.install.app)], capture_output=True)
+            self._wait_until_settled(min_s=settle)
+            proc = subprocess.Popen(cmd, stdout=open(log, "w"), stderr=subprocess.STDOUT)
+            sent = time.time()
+            while time.time() - sent < 120:
+                if started_path.exists():
+                    return proc
+                if proc.poll() is not None and time.time() - sent > 10:
+                    break
+                time.sleep(1)
+            if started_path.exists():
+                return proc
+            last_output = log.read_text(errors="replace")[-400:]
+            if "-1743" in last_output or "Not authorized" in last_output:
+                raise AfterEffectsError(
+                    "Terminal is not allowed to control After Effects. Allow it in System Settings > "
+                    "Privacy & Security > Automation, then start again.")
+            proc.kill()
+            self._force_quit()
+        raise AfterEffectsError(
+            "After Effects did not run the benchmark script after 3 tries. It may be showing a "
+            "dialog when it starts (crash repair, sign-in, update). Open it once, close the dialog, "
+            f"quit it and start again. Details: {last_output}")
+
+    def _wait_until_settled(self, min_s: float, max_s: float = 300) -> None:
+        """Wait until After Effects is running and its CPU use has dropped (start-up finished)."""
+        start = time.time()
+        quiet = 0
+        while time.time() - start < max_s:
+            time.sleep(2)
+            pids = subprocess.run(["pgrep", "-x", "After Effects"], capture_output=True,
+                                  text=True).stdout.split()
+            if not pids:
+                quiet = 0
+                continue
+            cpu = 0.0
+            for pid in pids:
+                out = subprocess.run(["ps", "-o", "%cpu=", "-p", pid], capture_output=True,
+                                     text=True).stdout.strip()
+                try:
+                    cpu += float(out or 0)
+                except ValueError:
+                    pass
+            quiet = quiet + 1 if cpu < 15 else 0
+            if quiet >= 3 and time.time() - start >= min_s:
+                return
+
+    def _force_quit(self) -> None:
+        """Close the After Effects instance we launched (it holds no user work)."""
+        for app in _running_mac_apps("After Effects"):
+            subprocess.run(["osascript", "-e", f'tell application "{app}" to quit'],
+                           capture_output=True, timeout=30)
+        for sig in ("-TERM", "-KILL"):
+            end = time.time() + 20
+            while time.time() < end and self.gui_running():
+                time.sleep(1)
+            if not self.gui_running():
+                return
+            subprocess.run(["pkill", sig, "-x", "After Effects"], capture_output=True)
+
+    def _wait_for_quit(self, proc, timeout: float = 120) -> None:
+        """Make sure the scripted AE instance has closed before aerender starts."""
+        end = time.time() + timeout
+        while time.time() < end:
+            if not self.gui_running():
+                break
+            time.sleep(1)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    def gui_running(self) -> bool:
+        if IS_MAC:
+            r = subprocess.run(["pgrep", "-x", "After Effects"], capture_output=True)
+            return r.returncode == 0
+        r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq AfterFX.exe", "/NH"],
+                           capture_output=True, text=True)
+        return "AfterFX.exe" in r.stdout
+
+    def ensure_closed(self, timeout: float = 90) -> None:
+        """Ask any open After Effects to quit, the same way as Cmd+Q / closing the window.
+
+        It still asks about unsaved work; nothing is force-killed."""
+        if not self.gui_running():
+            return
+        if IS_MAC:
+            for app in _running_mac_apps("After Effects"):
+                subprocess.run(["osascript", "-e", f'tell application "{app}" to quit'],
+                               capture_output=True, timeout=60)
+        else:
+            subprocess.run(["taskkill", "/IM", "AfterFX.exe"], capture_output=True)
+        end = time.time() + timeout
+        while time.time() < end:
+            if not self.gui_running():
+                time.sleep(3)  # let it release its files and licence
+                return
+            time.sleep(1)
+        raise AfterEffectsError(
+            "After Effects is open and did not quit (it may be asking to save a project). "
+            "Quit it, then start the benchmark again.")
+
+    # ---------------------------------------------------------------- project
+    def ensure_project(self) -> Dict[str, Any]:
+        """Build the benchmark project unless an identical one already exists."""
+        fp = build_fingerprint(self.install)
+        manifest_path = self.work / "manifest.json"
+        if self.project_path.exists() and manifest_path.exists():
+            cached = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if cached.get("fingerprint") == fp:
+                self.manifest = cached
+                return cached
+        problems = verify_assets()
+        if problems:
+            raise AfterEffectsError("Benchmark footage is damaged: " + "; ".join(problems))
+        render_dir = self.work / "render"
+        render_dir.mkdir(exist_ok=True)
+        job = {
+            "assets_dir": _js_path(staged(ASSETS, "footage")),
+            "project_path": _js_path(self.project_path),
+            "render_dir": _js_path(render_dir),
+        }
+        try:
+            payload = self.run_script("build_project.jsx", job, timeout=1800)
+        except AfterEffectsError:
+            # After Effects sometimes fails on its first scripted launch (licence check,
+            # first-run dialogs). One clean retry before giving up on every AE test.
+            payload = self.run_script("build_project.jsx", job, timeout=1800)
+        manifest = payload["manifest"]
+        manifest["fingerprint"] = fp
+        manifest["cache_prefs"] = cache_prefs(self.install)
+        manifest["disk_cache_dirs"] = [str(d) for d in disk_cache_dirs(self.install)]
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        self.manifest = manifest
+        return manifest
+
+    def output_for(self, comp: str) -> Dict[str, Any]:
+        for rq in (self.manifest or {}).get("render_queue", []):
+            if rq.get("comp") == comp:
+                return rq
+        for m in (self.manifest or {}).get("missing", []):
+            if m.get("what") == f"comp {comp}":
+                raise AfterEffectsError(f"{comp} could not be built in this version: {m.get('where')}")
+        raise AfterEffectsError(f"{comp} is not in the render queue of the built project")
+
+    # ---------------------------------------------------------------- render
+    def render(self, comp: str, start: int, end: int, mfr: bool, tag: str,
+               progress: Optional[Callable[[int, int], None]] = None) -> Dict[str, Any]:
+        rq = self.output_for(comp)
+        out_dir = self.work / "render" / tag
+        if out_dir.exists():
+            shutil.rmtree(out_dir, ignore_errors=True)
+        out_dir.mkdir(parents=True)
+        cache_cleared = clear_disk_cache(self.install)
+        ext = rq.get("output_extension", "jpg")
+        if rq.get("kind") == "jpeg":
+            target = out_dir / f"{comp}_[#####].{ext}"
+        else:
+            target = out_dir / f"{comp}.{ext}"
+        cmd = [
+            str(self.install.aerender),
+            "-project", str(self.project_path),
+            "-comp", comp,
+            "-s", str(start), "-e", str(end),
+            "-mfr", "ON" if mfr else "OFF", "100",
+            "-mem_usage", "50", "90",
+            "-output", str(target),
+            "-v", "ERRORS_AND_PROGRESS",
+            "-sound", "OFF",
+        ]
+        log = self.logs / f"aerender-{tag}.log"
+        frames = end - start + 1
+        seen = [0]
+
+        def on_line(tl) -> None:
+            if progress and FRAME_LINE.search(tl.text):
+                seen[0] += 1
+                progress(min(seen[0], frames), frames)
+
+        res: ProcResult = run_timed(cmd, timeout=max(1800, frames * 60), log_path=log, on_line=on_line)
+        timing = parse_render_timing(res.lines, frames)
+        out_files = [p for p in out_dir.iterdir() if p.is_file()]
+        detail = {
+            "wall_s": round(res.wall_s, 3),
+            "timing_method": timing["method"],
+            "frames": frames,
+            "frames_seen": timing["frames_seen"],
+            "mfr": mfr,
+            "output_files": len(out_files),
+            "output_bytes": sum(p.stat().st_size for p in out_files),
+            "disk_cache_cleared": cache_cleared,
+        }
+        # Rendered frames are only checked, never kept: a full run would otherwise fill the disk.
+        shutil.rmtree(out_dir, ignore_errors=True)
+        error = None
+        if res.timed_out:
+            error = "aerender timed out"
+        elif res.returncode not in (0, None):
+            error = f"aerender exited with code {res.returncode}: " + "; ".join(timing["errors"] or [res.output[-300:]])
+        elif not out_files:
+            error = "aerender produced no output"
+        elif rq.get("kind") == "jpeg" and len(out_files) < frames:
+            error = f"rendered {len(out_files)} of {frames} frames"
+        render_s = timing["render_s"] if timing["render_s"] is not None else res.wall_s
+        shutil.rmtree(out_dir, ignore_errors=True)
+        return {"seconds": render_s, "detail": detail, "error": error, "log": str(log)}
+
+    def time_open(self, opens: int) -> Dict[str, Any]:
+        return self.run_script("open_project.jsx", {
+            "project_path": _js_path(self.project_path), "opens": opens,
+        }, timeout=900)
+
+
+def _js_path(p: Path) -> str:
+    """Forward-slash path safe to embed in a JavaScript string."""
+    return str(p).replace("\\", "/").replace('"', '\\"')

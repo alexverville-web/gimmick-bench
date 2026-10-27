@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gimmick Bench</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --ink: #18181b; --quiet: #6b6b73; --line: #e4e2dc;
+    --accent: #f26b1d; --accent-ink: #ffffff; --ok: #1f9d55; --warn: #c27c0e; --bad: #d03b3b;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #121214; --panel: #1b1b1f; --ink: #f2f2f3; --quiet: #9a9aa3; --line: #2c2c32; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; }
+  main { max-width: 880px; margin: 0 auto; padding: 32px 16px 64px; }
+  header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 24px; }
+  h1 { font-size: 22px; margin: 0; letter-spacing: -0.01em; }
+  h1 span { color: var(--accent); }
+  .ver { color: var(--quiet); font-size: 13px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 20px; margin-bottom: 16px; }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--quiet); margin: 0 0 12px; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0; }
+  dt { color: var(--quiet); } dd { margin: 0; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+  label { color: var(--quiet); font-size: 13px; }
+  input, select { font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line);
+                  border-radius: 8px; padding: 6px 10px; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+           border-radius: 10px; padding: 10px 16px; cursor: pointer; }
+  button:hover { border-color: var(--quiet); }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; padding: 14px 22px; }
+  button:disabled { opacity: .45; cursor: default; }
+  .hint { color: var(--quiet); font-size: 13px; margin-top: 8px; }
+  .bar { height: 8px; background: var(--line); border-radius: 99px; overflow: hidden; margin: 12px 0 6px; }
+  .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .4s; }
+  ul.tests { list-style: none; padding: 0; margin: 12px 0 0; }
+  ul.tests li { display: flex; gap: 10px; padding: 6px 0; border-top: 1px solid var(--line); align-items: baseline; }
+  .chip { font-size: 12px; padding: 1px 8px; border-radius: 99px; border: 1px solid currentColor; white-space: nowrap; }
+  .ok { color: var(--ok); } .invalid, .skipped { color: var(--warn); } .error, .incompatible { color: var(--bad); }
+  .incompatible { color: var(--quiet); }
+  .reason { color: var(--quiet); font-size: 13px; }
+  .msg { padding: 12px 14px; border-radius: 10px; margin-top: 12px; border: 1px solid var(--line); }
+  .msg.bad { border-color: var(--bad); color: var(--bad); }
+  .demo { background: var(--warn); color: #fff; font-weight: 700; padding: 6px 12px; border-radius: 8px; display: none; margin-bottom: 16px; }
+  code { font-family: var(--mono); font-size: 13px; }
+  @media (max-width: 560px) { dl { grid-template-columns: 1fr; } dt { margin-top: 6px; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Gimmick <span>Bench</span></h1>
+    <div class="ver" id="ver"></div>
+  </header>
+  <div class="demo" id="demo">DEMO MODE: every number is made up and nothing is sent to the studio sheet.</div>
+
+  <section class="card">
+    <h2>This computer</h2>
+    <dl id="machine"><dt>Detecting</dt><dd>Reading hardware and installed apps…</dd></dl>
+    <div class="row" style="margin-top:16px">
+      <label>Name in the ranking <input id="label" size="18"></label>
+      <label>Mainly used for
+        <select id="role"><option value="2d">2D / After Effects</option><option value="3d">3D / Cinema 4D</option><option value="hybrid">Both</option></select>
+      </label>
+    </div>
+  </section>
+
+  <section class="card" id="start">
+    <h2>Run</h2>
+    <div class="row">
+      <button class="primary" data-run='{"quick":false}'>Run Full Benchmark</button>
+      <button data-run='{"quick":true}'>Quick run</button>
+      <button data-run='{"quick":false,"suites":["ae"]}'>After Effects only</button>
+      <button data-run='{"quick":false,"suites":["c4d","gpu"]}'>Cinema 4D only</button>
+    </div>
+    <div class="hint">Full run takes about 2 hours, Quick about 45 minutes. Plug in the power, close other apps, and leave the computer alone while it runs. Overnight is ideal.</div>
+  </section>
+
+  <section class="card" id="progress" hidden>
+    <h2>Progress</h2>
+    <div id="now">Starting…</div>
+    <div class="bar"><div id="fill"></div></div>
+    <div class="row" style="justify-content:space-between">
+      <span class="hint" id="eta"></span>
+      <button id="cancel">Stop</button>
+    </div>
+    <ul class="tests" id="done"></ul>
+    <div id="final"></div>
+  </section>
+</main>
+<script>
+const demo = new URLSearchParams(location.search).has("demo");
+document.getElementById("demo").style.display = demo ? "block" : "none";
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+async function api(path, body) {
+  const r = await fetch(path, body ? {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)} : {});
+  return r.json();
+}
+
+function gb(v) { return v == null ? "" : `${Math.round(v)} GB`; }
+
+async function loadInfo() {
+  const r = await api("/api/info");
+  $("ver").textContent = `Suite ${r.suite_version}`;
+  $("label").value = r.config.label; $("role").value = r.config.role;
+  if (r.error) { $("machine").innerHTML = `<dt>Problem</dt><dd>${esc(r.error)}</dd>`; return; }
+  if (!r.info) { setTimeout(loadInfo, 1500); return; }
+  const m = r.info.machine, s = r.info.software;
+  const gpus = (m.gpus || []).map(g => g.name + (g.cores ? ` (${g.cores} cores)` : "") + (g.vram_gb ? `, ${gb(g.vram_gb)}` : "")).join(" + ");
+  const rows = [
+    ["Model", [m.model_name || m.model_id, m.model_year].filter(Boolean).join(", ")],
+    ["System", m.os_version],
+    ["Processor", m.cpu + (m.p_cores ? ` (${m.p_cores} performance + ${m.e_cores} efficiency cores)` : m.cpu_cores ? ` (${m.cpu_cores} cores)` : "")],
+    ["Memory", gb(m.ram_gb)],
+    ["Graphics", gpus || "Unknown"],
+    ["After Effects", s.after_effects ? `${s.after_effects_year} (${s.after_effects})` : "Not found (2025 or later needed)"],
+    ["Cinema 4D", s.cinema4d ? `${s.cinema4d_year} (${s.cinema4d})` : "Not found (2024 or later needed)"],
+    ["Octane", s.octane || (s.octane_plugin_dirs && s.octane_plugin_dirs.length ? "Plugin folder found, checked when the run starts" : "Not found (GPU test will be skipped, not scored)")],
+    ["Studio sheet", r.config.sheet ? "Connected" : "Not set up (results are saved on this computer)"],
+  ];
+  $("machine").innerHTML = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("");
+}
+
+function minutes(s) { return s < 90 ? "about a minute" : `about ${Math.round(s / 60)} minutes`; }
+
+async function poll() {
+  const s = await api("/api/state");
+  $("progress").hidden = !(s.running || s.result_path || s.error || s.finished.length);
+  document.querySelectorAll("[data-run]").forEach(b => b.disabled = s.running);
+  $("cancel").hidden = !s.running;
+  $("fill").style.width = `${Math.round((s.progress || 0) * 100)}%`;
+  const it = s.iteration;
+  if (s.running) {
+    const title = s.current ? s.current.title : "Preparing";
+    const step = it && it.test === (s.current || {}).test ? ` · ${it.phase === "warm-up" ? "warm-up run" : `run ${it.i} of ${it.n}`}` : "";
+    const fr = s.frame && it && s.frame.tag && s.frame.t > (it.t || 0) ? ` · frame ${s.frame.n} of ${s.frame.of}` : "";
+    $("now").textContent = title + step + fr;
+    $("eta").textContent = (s.status && !it ? s.status + ". " : "") + (s.eta_s ? `Rough estimate: ${minutes(s.eta_s)} left` : "Estimating time left after the first runs");
+  } else {
+    $("now").textContent = s.error ? "Stopped" : "Finished";
+    $("eta").textContent = "";
+  }
+  $("done").innerHTML = s.finished.map(e => `<li><span class="chip ${esc(e.status)}">${esc(e.status)}</span><span title="${esc(e.test)}">${esc(e.title || e.test)}</span><span class="reason">${esc(e.reason || "")}</span></li>`).join("");
+  let fin = "";
+  if (s.error) fin += `<div class="msg bad">${esc(s.error)}</div>`;
+  if (s.result_path) fin += `<div class="msg">Result saved: <code>${esc(s.result_path)}</code><br>${esc(s.upload || "")}</div>`;
+  $("final").innerHTML = fin;
+  setTimeout(poll, s.running ? 1500 : 4000);
+}
+
+document.querySelectorAll("[data-run]").forEach(b => b.addEventListener("click", async () => {
+  const opts = JSON.parse(b.dataset.run);
+  if (demo) opts.simulate = true;
+  const r = await api("/api/run", opts);
+  if (r.error) alert(r.error);
+}));
+$("cancel").addEventListener("click", () => { if (confirm("Stop the benchmark? Finished tests are kept.")) api("/api/cancel", {}); });
+$("label").addEventListener("change", e => api("/api/config", {label: e.target.value}));
+$("role").addEventListener("change", e => api("/api/config", {role: e.target.value}));
+loadInfo(); poll();
+</script>
+</body>
+</html>
