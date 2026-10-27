@@ -191,7 +191,10 @@ class AfterEffects:
         wrapper = self.work / f"{stamp}.wrapper.jsx"
         job = dict(job, done_path=_js_path(done_path), quit=True)
         job_path.write_text(json.dumps(job), encoding="utf-8")
+        started_path = self.work / f"{stamp}.started"
         wrapper.write_text(
+            f'(function () {{ var f = new File("{_js_path(started_path)}"); '
+            f'if (f.open("w")) {{ f.write("1"); f.close(); }} }})();\n'
             f'var GB_JOB_PATH = "{_js_path(job_path)}";\n'
             f'var GB_SCRIPTS_DIR = "{_js_path(SCRIPTS)}";\n'
             f'$.evalFile(GB_SCRIPTS_DIR + "/common.jsx");\n'
@@ -200,14 +203,7 @@ class AfterEffects:
         )
         log = self.logs / f"{stamp}.log"
         if IS_MAC:
-            js = f'$.evalFile(\\"{_js_path(wrapper)}\\")'
-            cmd = [
-                "osascript",
-                "-e", f"with timeout of {int(timeout)} seconds",
-                "-e", f'tell application "{self.install.app}" to DoScript "{js}"',
-                "-e", "end timeout",
-            ]
-            proc = subprocess.Popen(cmd, stdout=open(log, "w"), stderr=subprocess.STDOUT)
+            proc = self._mac_do_script(wrapper, started_path, log, timeout)
         else:
             proc = subprocess.Popen([str(self.install.app), "-r", str(wrapper)],
                                     stdout=open(log, "w"), stderr=subprocess.STDOUT)
@@ -215,14 +211,6 @@ class AfterEffects:
         while time.time() < deadline:
             if done_path.exists():
                 break
-            if IS_MAC and proc.poll() not in (None, 0) and not done_path.exists():
-                # osascript failed before the script could run (permissions, app missing).
-                time.sleep(2)
-                if not done_path.exists():
-                    raise AfterEffectsError(
-                        "Could not run a script in After Effects. Allow this app to control "
-                        "After Effects (System Settings > Privacy & Security > Automation). "
-                        f"Details: {log.read_text(errors='replace')[-400:]}")
             time.sleep(1)
         else:
             proc.kill()
@@ -236,6 +224,81 @@ class AfterEffects:
         if not payload.get("ok"):
             raise AfterEffectsError(f"{script} failed: {payload.get('error')}")
         return payload
+
+    def _mac_do_script(self, wrapper: Path, started_path: Path, log: Path, timeout: float):
+        """Launch After Effects, wait until it has finished starting, then send DoScript.
+
+        A DoScript sent while AE is still loading fails with "Scripting Plugin is not
+        installed" and leaves a dialog open, so we wait for it to settle and retry with
+        a longer wait if the script did not start."""
+        js = f'$.evalFile(\\"{_js_path(wrapper)}\\")'
+        cmd = [
+            "osascript",
+            "-e", f"with timeout of {int(timeout)} seconds",
+            "-e", f'tell application "{self.install.app}" to DoScript "{js}"',
+            "-e", "end timeout",
+        ]
+        last_output = ""
+        for attempt, settle in enumerate((20, 45, 90)):
+            subprocess.run(["open", "-a", str(self.install.app)], capture_output=True)
+            self._wait_until_settled(min_s=settle)
+            proc = subprocess.Popen(cmd, stdout=open(log, "w"), stderr=subprocess.STDOUT)
+            sent = time.time()
+            while time.time() - sent < 120:
+                if started_path.exists():
+                    return proc
+                if proc.poll() is not None and time.time() - sent > 10:
+                    break
+                time.sleep(1)
+            if started_path.exists():
+                return proc
+            last_output = log.read_text(errors="replace")[-400:]
+            if "-1743" in last_output or "Not authorized" in last_output:
+                raise AfterEffectsError(
+                    "Terminal is not allowed to control After Effects. Allow it in System Settings > "
+                    "Privacy & Security > Automation, then start again.")
+            proc.kill()
+            self._force_quit()
+        raise AfterEffectsError(
+            "After Effects did not run the benchmark script after 3 tries. It may be showing a "
+            "dialog when it starts (crash repair, sign-in, update). Open it once, close the dialog, "
+            f"quit it and start again. Details: {last_output}")
+
+    def _wait_until_settled(self, min_s: float, max_s: float = 300) -> None:
+        """Wait until After Effects is running and its CPU use has dropped (start-up finished)."""
+        start = time.time()
+        quiet = 0
+        while time.time() - start < max_s:
+            time.sleep(2)
+            pids = subprocess.run(["pgrep", "-x", "After Effects"], capture_output=True,
+                                  text=True).stdout.split()
+            if not pids:
+                quiet = 0
+                continue
+            cpu = 0.0
+            for pid in pids:
+                out = subprocess.run(["ps", "-o", "%cpu=", "-p", pid], capture_output=True,
+                                     text=True).stdout.strip()
+                try:
+                    cpu += float(out or 0)
+                except ValueError:
+                    pass
+            quiet = quiet + 1 if cpu < 15 else 0
+            if quiet >= 3 and time.time() - start >= min_s:
+                return
+
+    def _force_quit(self) -> None:
+        """Close the After Effects instance we launched (it holds no user work)."""
+        for app in _running_mac_apps("After Effects"):
+            subprocess.run(["osascript", "-e", f'tell application "{app}" to quit'],
+                           capture_output=True, timeout=30)
+        for sig in ("-TERM", "-KILL"):
+            end = time.time() + 20
+            while time.time() < end and self.gui_running():
+                time.sleep(1)
+            if not self.gui_running():
+                return
+            subprocess.run(["pkill", sig, "-x", "After Effects"], capture_output=True)
 
     def _wait_for_quit(self, proc, timeout: float = 120) -> None:
         """Make sure the scripted AE instance has closed before aerender starts."""
