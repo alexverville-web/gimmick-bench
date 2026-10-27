@@ -20,13 +20,13 @@ Phase 1 architecture document.
 
 | ID | What it does | Timed by |
 | --- | --- | --- |
-| ae.shapes | 300+ animated shape layers (repeaters, trim, offset, wiggle paths), 6 precomp instances, motion blur. MFR off. 120 frames | aerender progress lines |
-| ae.expressions | 160 layers driven by wiggle, sampleImage, valueAtTime chains and loopOut; 40 live source-text layers with animators. MFR off. 120 frames | aerender |
-| ae.mixed_4k | 4K H.264 + ProRes footage, feathered masks, a track matte, typography, precomps, grading and grain. MFR on. 150 frames | aerender |
+| ae.shapes | 300+ animated shape layers (repeaters, trim, offset, wiggle paths), 6 precomp instances, motion blur. MFR off. 24 frames | aerender progress lines |
+| ae.expressions | 160 layers driven by wiggle, sampleImage, valueAtTime chains and loopOut; 40 live source-text layers with animators. MFR off. 5 frames | aerender |
+| ae.mixed_4k | 4K H.264 + ProRes footage, feathered masks, a track matte, typography, precomps, grading and grain. MFR on. 60 frames | aerender |
 | ae.effects | Turbulent Displace, Fractal Noise, Gaussian blur, Glow, Camera Lens Blur, Directional Blur, Light Rays, Lumetri, Add Grain. MFR on. 90 frames | aerender |
 | ae.mfr_scaling | ae.mixed_4k with MFR off; speed-up = off ÷ on | aerender |
 | ae.preview | The effects comp at half resolution, draft quality, in frames per second | aerender |
-| ae.export_prores, ae.export_h264 | The mixed comp to a ProRes and an H.264 file, encoding included | aerender |
+| ae.export_prores, ae.export_h264 | The mixed comp to a ProRes and an H.264 file, encoding included (75 frames) | aerender |
 | ae.open_cold, ae.open_warm | `app.open()` of the project: first open after launch, then repeated | ExtendScript `$.hiresTimer` |
 | c4d.load_cold, c4d.load_warm | About 4 million baked polygons with 4K textures | c4dpy `perf_counter` around `LoadDocument` |
 | c4d.geometry | Subdivision surfaces over animated deformers, booleans, sweeps; 120 frames | c4dpy around `ExecutePasses` |
@@ -51,10 +51,10 @@ memory and MFR preferences do not change the result.
 1. **Preflight:** AC power, at least 20 GB free (warning under 60 GB), up to 10 minutes
    waiting for CPU use under 15%, busiest processes recorded.
 2. **Cool-down** before each test: at least 30 s (10 s in quick mode) and until the thermal state is nominal or fair.
-3. **Warm-up** run, recorded but not scored.
-4. **Measured runs:** 5 (quick: 3). Multitasking: 3 (quick: 1).
+3. **Warm-up** run, recorded but not scored (not for After Effects renders, see 4).
+4. **Measured runs:** 5 (quick: 3). After Effects renders: 3, with fewer frames in quick mode; the AE disk cache is emptied before every render, so each run renders from scratch instead of reading the previous run's cached frames. Multitasking: 3 (quick: 1).
 5. **Statistics:** median. With 5 or more runs, a run more than 3 scaled MADs from the
-   median is an outlier: kept in the raw data, excluded from the median. A test is
+   median, and more than 2% away from it, is an outlier: kept in the raw data, excluded from the median. A test is
    `invalid` if fewer than 3 good runs remain or the coefficient of variation exceeds 10%.
 6. **Monitoring** every 2 s: thermal state (macOS), CPU speed limit (Intel Macs), memory
    free, swap, compressed memory (macOS), CPU use (Windows), GPU temperature and thermal

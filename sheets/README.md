@@ -21,12 +21,15 @@ so the formulas can change without re-running anything.
    - Execute as: **Me**
    - Who has access: **Anyone** (the token is what protects it)
    Copy the web app URL.
-6. On each computer, put the URL and token in `~/GimmickBench/config.json`
-   (Windows: `C:\Users\<you>\GimmickBench\config.json`), or run:
+6. Put the URL and token in a file named `studio.json` at the top of the benchmark folder
+   (next to `README.md`), then copy that folder to every computer. Nothing else to set up there:
 
    ```
-   python3 -m gimmick_bench configure --sheet-url "<web app URL>" --sheet-token "<token>"
+   { "sheet_url": "<web app URL>", "sheet_token": "<token>" }
    ```
+
+   (`studio.json` is not in git, because of the token. A single computer can also be set
+   with `python3 -m gimmick_bench configure --sheet-url "<url>" --sheet-token "<token>"`.)
 
 The token is a shared secret. Keep it inside the studio; anyone with the URL and
 token can add rows.

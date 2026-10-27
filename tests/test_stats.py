@@ -49,3 +49,9 @@ class StatsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SteadyRunsTest(unittest.TestCase):
+    def test_tiny_jitter_is_not_an_outlier(self):
+        # Seen on the first real run: five renders within 0.8% of each other.
+        self.assertEqual(stats.outlier_indices([225.18, 226.99, 225.68, 225.24, 225.25]), [])

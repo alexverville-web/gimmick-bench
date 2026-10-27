@@ -48,13 +48,26 @@ def config_path() -> Path:
     return home_dir() / "config.json"
 
 
+# Studio-wide settings shipped inside the benchmark folder (not in git: it holds the
+# sheet token). Copy the folder with this file to a computer and it uploads with
+# no setup there. A computer's own config.json wins for anything it sets.
+STUDIO_FILE = REPO_ROOT / "studio.json"
+
+
+def _read(p: Path) -> dict:
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in data.items() if k in Config.__dataclass_fields__}
+
+
 def load_config() -> Config:
-    p = config_path()
-    if not p.exists():
-        return Config()
-    data = json.loads(p.read_text(encoding="utf-8"))
-    known = {k: v for k, v in data.items() if k in Config.__dataclass_fields__}
-    return Config(**known)
+    data = _read(STUDIO_FILE)
+    for k, v in _read(config_path()).items():
+        if v not in ("", None) or k not in data:
+            data[k] = v
+    return Config(**data)
 
 
 def save_config(cfg: Config) -> Path:

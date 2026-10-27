@@ -445,7 +445,15 @@ function queue(comp, outDir, kind, rs, manifest) {
     var om = item.outputModule(1);
     var ext = "jpg";
     if (kind === "jpeg") {
-        try { om.setSettings({ "Format": "JPEG Sequence" }); } catch (e1) {}
+        // Try the JPEG format names used by different versions, then any JPEG template.
+        var jpegNames = ["JPEG Sequence", "JPEG", "Séquence JPEG"];
+        for (var jn = 0; jn < jpegNames.length && String(formatOf(om)).indexOf("JPEG") < 0; jn++) {
+            try { om.setSettings({ "Format": jpegNames[jn] }); } catch (e1) {}
+        }
+        if (String(formatOf(om)).indexOf("JPEG") < 0) {
+            var jt = pickName(om.templates, ["JPEG"]);
+            if (jt) { try { om.applyTemplate(jt); used.output_module = jt; } catch (e2) {} }
+        }
         if (String(formatOf(om)).indexOf("JPEG") < 0) {
             var tif = pickName(om.templates, ["TIFF"]);
             if (tif) { om.applyTemplate(tif); ext = "tif"; used.output_module = tif; }

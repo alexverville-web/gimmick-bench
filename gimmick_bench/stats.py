@@ -18,6 +18,9 @@ OUTLIER_K = 3.0
 MAD_SCALE = 1.4826  # makes MAD consistent with the standard deviation for normal data
 MAX_CV = 0.10
 MIN_FOR_OUTLIERS = 5
+# Very steady tests (CV well under 1%) give a tiny MAD; a run is only an outlier
+# if it is also this far from the median, so normal jitter is never rejected.
+MIN_OUTLIER_DEVIATION = 0.02
 SLOWDOWN_THRESHOLD = 0.05  # 5% slower from first to last half suggests throttling
 
 
@@ -73,7 +76,7 @@ def outlier_indices(values: Sequence[float], k: float = OUTLIER_K) -> List[int]:
         if spread == 0:
             if m and abs(v - m) / m > 0.01:
                 out.append(i)
-        elif abs(v - m) > k * spread:
+        elif abs(v - m) > k * spread and (not m or abs(v - m) / abs(m) > MIN_OUTLIER_DEVIATION):
             out.append(i)
     return out
 

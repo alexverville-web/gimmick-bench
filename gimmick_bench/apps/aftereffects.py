@@ -201,6 +201,65 @@ def install_startup_launcher(install: AEInstall) -> List[Path]:
     return written
 
 
+def disk_cache_dirs(install: AEInstall) -> List[Path]:
+    """After Effects disk cache folders at their default places.
+
+    Each aerender run would otherwise reuse frames cached by the previous one and
+    measure reading the cache instead of rendering (seen on the first real run:
+    later runs 5 to 20 times faster than the first)."""
+    if IS_MAC:
+        roots = [Path.home() / "Library" / "Caches" / "Adobe" / "After Effects"]
+    else:
+        roots = [Path(os.environ.get("APPDATA", "")) / "Adobe" / "After Effects",
+                 Path(os.environ.get("LOCALAPPDATA", "")) / "Adobe" / "After Effects",
+                 Path(os.environ.get("LOCALAPPDATA", "")) / "Temp"]
+    found = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for p in list(root.glob("*")) + list(root.glob("*/*")):
+            if p.is_dir() and "disk cache" in p.name.lower():
+                found.append(p)
+    return found
+
+
+def clear_disk_cache(install: AEInstall) -> Dict[str, Any]:
+    """Empty the disk cache folders (their contents, not the folders). Returns what was done."""
+    out: Dict[str, Any] = {"folders": [], "bytes": 0}
+    for d in disk_cache_dirs(install):
+        size = 0
+        for p in d.rglob("*"):
+            try:
+                if p.is_file():
+                    size += p.stat().st_size
+            except OSError:
+                pass
+        for child in d.iterdir():
+            try:
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink()
+            except OSError:
+                pass
+        out["folders"].append(str(d))
+        out["bytes"] += size
+    return out
+
+
+def cache_prefs(install: AEInstall) -> List[str]:
+    """Preference lines that mention a cache, kept in the result to check the cache handling."""
+    lines = []
+    for f in ae_pref_files(install):
+        try:
+            for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+                if "cache" in line.lower() and len(lines) < 40:
+                    lines.append(line.strip()[:200])
+        except OSError:
+            pass
+    return lines
+
+
 def _running_mac_apps(process_name: str) -> List[str]:
     """Bundle paths of running apps whose executable is called process_name."""
     r = subprocess.run(["pgrep", "-x", process_name], capture_output=True, text=True)
@@ -437,6 +496,8 @@ class AfterEffects:
             payload = self.run_script("build_project.jsx", job, timeout=1800)
         manifest = payload["manifest"]
         manifest["fingerprint"] = fp
+        manifest["cache_prefs"] = cache_prefs(self.install)
+        manifest["disk_cache_dirs"] = [str(d) for d in disk_cache_dirs(self.install)]
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         self.manifest = manifest
         return manifest
@@ -458,6 +519,7 @@ class AfterEffects:
         if out_dir.exists():
             shutil.rmtree(out_dir, ignore_errors=True)
         out_dir.mkdir(parents=True)
+        cache_cleared = clear_disk_cache(self.install)
         ext = rq.get("output_extension", "jpg")
         if rq.get("kind") == "jpeg":
             target = out_dir / f"{comp}_[#####].{ext}"
@@ -494,7 +556,10 @@ class AfterEffects:
             "mfr": mfr,
             "output_files": len(out_files),
             "output_bytes": sum(p.stat().st_size for p in out_files),
+            "disk_cache_cleared": cache_cleared,
         }
+        # Rendered frames are only checked, never kept: a full run would otherwise fill the disk.
+        shutil.rmtree(out_dir, ignore_errors=True)
         error = None
         if res.timed_out:
             error = "aerender timed out"
