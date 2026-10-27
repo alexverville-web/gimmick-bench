@@ -159,3 +159,20 @@ class WindowsParseTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScriptPrefTest(unittest.TestCase):
+    def test_turns_existing_pref_on(self):
+        from gimmick_bench.apps.aftereffects import enable_script_pref
+        text = '["Main Pref Section v2"]\n\t"Pref_SCRIPTING_FILE_NETWORK_SECURITY" = 00\n'
+        self.assertIn('SECURITY" = 01', enable_script_pref(text))
+
+    def test_leaves_pref_that_is_on(self):
+        from gimmick_bench.apps.aftereffects import enable_script_pref
+        self.assertIsNone(enable_script_pref('\t"Pref_SCRIPTING_FILE_NETWORK_SECURITY" = 01\n'))
+
+    def test_adds_missing_pref_under_section(self):
+        from gimmick_bench.apps.aftereffects import enable_script_pref
+        text = '["Other"]\n\t"x" = 1\n["Main Pref Section v2"]\n\t"y" = 2\n'
+        out = enable_script_pref(text)
+        self.assertIn('["Main Pref Section v2"]\n\t"Pref_SCRIPTING_FILE_NETWORK_SECURITY" = 01\n\t"y"', out)

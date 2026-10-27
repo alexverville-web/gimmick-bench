@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -105,6 +106,58 @@ def parse_render_timing(lines, frames_expected: Optional[int] = None) -> Dict[st
     return out
 
 
+SCRIPT_PREF_SECTION = '["Main Pref Section v2"]'
+SCRIPT_PREF_KEY = '"Pref_SCRIPTING_FILE_NETWORK_SECURITY"'
+
+
+def ae_pref_files(install: AEInstall) -> List[Path]:
+    """The preference files of this After Effects version (only exist after a first launch)."""
+    if IS_MAC:
+        base = Path.home() / "Library" / "Preferences" / "Adobe" / "After Effects"
+    else:
+        base = Path(os.environ.get("APPDATA", "")) / "Adobe" / "After Effects"
+    pattern = f"{install.major}.*" if install.major else "*"
+    return sorted(base.glob(f"{pattern}/Adobe After Effects * Prefs*.txt"))
+
+
+def enable_script_pref(text: str) -> Optional[str]:
+    """Turn on 'Allow Scripts to Write Files and Access Network'. None if already on."""
+    m = re.search(re.escape(SCRIPT_PREF_KEY) + r"\s*=\s*(\d+)", text)
+    if m:
+        if int(m.group(1)) != 0:
+            return None
+        return text[:m.start(1)] + "01" + text[m.end(1):]
+    i = text.find(SCRIPT_PREF_SECTION)
+    if i < 0:
+        return None
+    eol = text.find("\n", i)
+    eol = len(text) if eol < 0 else eol + 1
+    nl = "\r\n" if "\r\n" in text else "\n"
+    return text[:eol] + f"\t{SCRIPT_PREF_KEY} = 01{nl}" + text[eol:]
+
+
+def allow_script_file_access(install: AEInstall) -> List[str]:
+    """Set the scripting preference so a forgotten checkbox does not stop the benchmark.
+
+    After Effects must be closed: it rewrites the file when it quits."""
+    changed = []
+    for f in ae_pref_files(install):
+        try:
+            raw = f.read_bytes()
+            text = raw.decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        new = enable_script_pref(text)
+        if new is None:
+            continue
+        backup = f.with_name(f.name + ".gimmick-bench.bak")
+        if not backup.exists():
+            backup.write_bytes(raw)
+        f.write_bytes(new.encode("utf-8"))
+        changed.append(str(f))
+    return changed
+
+
 def _running_mac_apps(process_name: str) -> List[str]:
     """Bundle paths of running apps whose executable is called process_name."""
     r = subprocess.run(["pgrep", "-x", process_name], capture_output=True, text=True)
@@ -131,6 +184,7 @@ class AfterEffects:
     def run_script(self, script: str, job: Dict[str, Any], timeout: float = 1800) -> Dict[str, Any]:
         """Run one of our .jsx files inside After Effects and return what it wrote."""
         self.ensure_closed()
+        allow_script_file_access(self.install)
         stamp = f"{script.replace('.jsx', '')}-{int(time.time() * 1000)}"
         job_path = self.work / f"{stamp}.job.json"
         done_path = self.work / f"{stamp}.done.json"
@@ -240,11 +294,17 @@ class AfterEffects:
             raise AfterEffectsError("Benchmark footage is damaged: " + "; ".join(problems))
         render_dir = self.work / "render"
         render_dir.mkdir(exist_ok=True)
-        payload = self.run_script("build_project.jsx", {
+        job = {
             "assets_dir": _js_path(ASSETS),
             "project_path": _js_path(self.project_path),
             "render_dir": _js_path(render_dir),
-        }, timeout=1800)
+        }
+        try:
+            payload = self.run_script("build_project.jsx", job, timeout=1800)
+        except AfterEffectsError:
+            # After Effects sometimes fails on its first scripted launch (licence check,
+            # first-run dialogs). One clean retry before giving up on every AE test.
+            payload = self.run_script("build_project.jsx", job, timeout=1800)
         manifest = payload["manifest"]
         manifest["fingerprint"] = fp
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")

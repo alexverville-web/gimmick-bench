@@ -43,12 +43,12 @@ tool without the apps. Those results are marked as simulated and are never uploa
 
 ## One-time setup per computer
 
-- **After Effects:** Preferences > Scripting & Expressions > enable *Allow Scripts to Write Files and Access Network*.
+- **After Effects:** launch it once so it creates its preferences. The benchmark turns on *Allow Scripts to Write Files and Access Network* itself (a backup of the preferences file is kept next to it).
 - **Mac only:** the first run asks to let Terminal control After Effects. Click OK (System Settings > Privacy & Security > Automation).
 - **Cinema 4D:** open `c4dpy` once from the Cinema 4D folder and sign in with the Maxon App, so the benchmark can run it without a login prompt.
 - **Results sheet:** follow [sheets/README.md](sheets/README.md) once for the studio, then on each computer:
   `python3 -m gimmick_bench configure --sheet-url "<url>" --sheet-token "<token>"`.
-- Quit After Effects and Cinema 4D before starting; the benchmark launches them itself.
+- If After Effects is open when a run starts, the benchmark asks it to quit (it still asks about unsaved work).
 
 ## What is measured
 
